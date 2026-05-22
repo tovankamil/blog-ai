@@ -1,0 +1,878 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
+)
+
+var (
+	ErrNotFound          = errors.New("not found")
+	ErrValidation        = errors.New("validation error")
+	ErrPublishGateFailed = errors.New("publish gate failed")
+	Default              *Store
+)
+
+type ArticleStatus string
+
+const (
+	StatusIdea            ArticleStatus = "idea"
+	StatusSourced         ArticleStatus = "sourced"
+	StatusDraft           ArticleStatus = "draft"
+	StatusAIAssisted      ArticleStatus = "ai_assisted"
+	StatusPlagiarismCheck ArticleStatus = "plagiarism_check"
+	StatusReview          ArticleStatus = "review"
+	StatusScheduled       ArticleStatus = "scheduled"
+	StatusPublished       ArticleStatus = "published"
+	StatusArchived        ArticleStatus = "archived"
+)
+
+type Article struct {
+	ID              string        `json:"id"`
+	Title           string        `json:"title"`
+	Slug            string        `json:"slug"`
+	Excerpt         string        `json:"excerpt"`
+	ContentMD       string        `json:"content_md"`
+	ContentHTML     string        `json:"content_html"`
+	Status          ArticleStatus `json:"status"`
+	CategoryID      string        `json:"category_id"`
+	CategorySlug    string        `json:"category_slug"`
+	AuthorID        string        `json:"author_id"`
+	MetaTitle       string        `json:"meta_title"`
+	MetaDescription string        `json:"meta_description"`
+	CoverImageURL   string        `json:"cover_image_url"`
+	PublishedAt     *time.Time    `json:"published_at,omitempty"`
+	CreatedAt       time.Time     `json:"created_at"`
+	UpdatedAt       time.Time     `json:"updated_at"`
+}
+
+type Category struct {
+	ID          string    `json:"id"`
+	Name        string    `json:"name"`
+	Slug        string    `json:"slug"`
+	Description string    `json:"description"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+type Source struct {
+	ID                   string     `json:"id"`
+	Domain               string     `json:"domain"`
+	SourceName           string     `json:"source_name"`
+	Category             string     `json:"category"`
+	ReviewStatus         string     `json:"review_status"`
+	RobotsStatus         string     `json:"robots_status"`
+	TermsReviewStatus    string     `json:"terms_review_status"`
+	CrawlEnabled         bool       `json:"crawl_enabled"`
+	CrawlIntervalMinutes int        `json:"crawl_interval_minutes"`
+	LastCheckedAt        *time.Time `json:"last_checked_at,omitempty"`
+	CreatedAt            time.Time  `json:"created_at"`
+	UpdatedAt            time.Time  `json:"updated_at"`
+}
+
+type TrendCandidate struct {
+	Topic            string   `json:"topic"`
+	TrendScore       int      `json:"trend_score"`
+	ApprovedSources  int      `json:"approved_sources"`
+	SourceRecordURLs []string `json:"source_record_urls"`
+}
+
+type Job struct {
+	ID            string         `json:"id"`
+	ArticleID     string         `json:"article_id,omitempty"`
+	JobType       string         `json:"job_type"`
+	Status        string         `json:"status"`
+	Payload       map[string]any `json:"payload"`
+	ResultSummary map[string]any `json:"result_summary"`
+	ErrorMessage  string         `json:"error_message"`
+	CreatedAt     time.Time      `json:"created_at"`
+	UpdatedAt     time.Time      `json:"updated_at"`
+}
+
+type PlagiarismCheck struct {
+	ArticleID                string    `json:"article_id"`
+	Status                   string    `json:"status"`
+	OverallSimilarityScore   float64   `json:"overall_similarity_score"`
+	MaxSourceSimilarityScore float64   `json:"max_source_similarity_score"`
+	MatchedSources           []string  `json:"matched_sources"`
+	ReviewNotes              string    `json:"review_notes"`
+	CheckedAt                time.Time `json:"checked_at"`
+}
+
+type CreateArticleInput struct {
+	Title           string `json:"title"`
+	Slug            string `json:"slug"`
+	Excerpt         string `json:"excerpt"`
+	ContentMD       string `json:"content_md"`
+	ContentHTML     string `json:"content_html"`
+	Status          string `json:"status"`
+	CategorySlug    string `json:"category_slug"`
+	MetaTitle       string `json:"meta_title"`
+	MetaDescription string `json:"meta_description"`
+	CoverImageURL   string `json:"cover_image_url"`
+}
+
+type UpdateArticleInput struct {
+	Title           string `json:"title"`
+	Slug            string `json:"slug"`
+	Excerpt         string `json:"excerpt"`
+	ContentMD       string `json:"content_md"`
+	ContentHTML     string `json:"content_html"`
+	Status          string `json:"status"`
+	CategorySlug    string `json:"category_slug"`
+	MetaTitle       string `json:"meta_title"`
+	MetaDescription string `json:"meta_description"`
+	CoverImageURL   string `json:"cover_image_url"`
+}
+
+type CreateSourceInput struct {
+	Domain               string `json:"domain"`
+	SourceName           string `json:"source_name"`
+	Category             string `json:"category"`
+	ReviewStatus         string `json:"review_status"`
+	RobotsStatus         string `json:"robots_status"`
+	TermsReviewStatus    string `json:"terms_review_status"`
+	CrawlEnabled         bool   `json:"crawl_enabled"`
+	CrawlIntervalMinutes int    `json:"crawl_interval_minutes"`
+}
+
+type UpdateSourceInput struct {
+	SourceName           string `json:"source_name"`
+	Category             string `json:"category"`
+	ReviewStatus         string `json:"review_status"`
+	RobotsStatus         string `json:"robots_status"`
+	TermsReviewStatus    string `json:"terms_review_status"`
+	CrawlEnabled         bool   `json:"crawl_enabled"`
+	CrawlIntervalMinutes int    `json:"crawl_interval_minutes"`
+}
+
+type Store struct {
+	db *sql.DB
+}
+
+func Init(connectionString string) error {
+	db, err := sql.Open("pgx", connectionString)
+	if err != nil {
+		return fmt.Errorf("open db: %w", err)
+	}
+
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(30 * time.Minute)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return fmt.Errorf("ping db: %w", err)
+	}
+
+	Default = &Store{db: db}
+	return nil
+}
+
+func (s *Store) ListPublishedArticles() []Article {
+	rows, err := s.db.Query(articleSelectQuery+`
+WHERE a.status = 'published'
+ORDER BY a.published_at DESC NULLS LAST, a.updated_at DESC`)
+	if err != nil {
+		return []Article{}
+	}
+	defer rows.Close()
+
+	return scanArticles(rows)
+}
+
+func (s *Store) SearchPublishedArticles(query string) []Article {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return s.ListPublishedArticles()
+	}
+
+	rows, err := s.db.Query(articleSelectQuery+`
+WHERE a.status = 'published'
+  AND (
+    a.title ILIKE '%' || $1 || '%'
+    OR a.excerpt ILIKE '%' || $1 || '%'
+    OR a.content_md ILIKE '%' || $1 || '%'
+    OR a.meta_description ILIKE '%' || $1 || '%'
+  )
+ORDER BY a.published_at DESC NULLS LAST, a.updated_at DESC`, query)
+	if err != nil {
+		return []Article{}
+	}
+	defer rows.Close()
+
+	return scanArticles(rows)
+}
+
+func (s *Store) GetPublishedArticleBySlug(slug string) (Article, error) {
+	row := s.db.QueryRow(articleSelectQuery+`
+WHERE a.status = 'published' AND a.slug = $1`, slug)
+
+	article, err := scanArticle(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Article{}, ErrNotFound
+		}
+		return Article{}, err
+	}
+
+	return article, nil
+}
+
+func (s *Store) ListAllArticles() []Article {
+	rows, err := s.db.Query(articleSelectQuery + `
+ORDER BY a.updated_at DESC`)
+	if err != nil {
+		return []Article{}
+	}
+	defer rows.Close()
+
+	return scanArticles(rows)
+}
+
+func (s *Store) CreateArticle(input CreateArticleInput) (Article, error) {
+	if strings.TrimSpace(input.Title) == "" || strings.TrimSpace(input.Slug) == "" || strings.TrimSpace(input.MetaDescription) == "" || strings.TrimSpace(input.CategorySlug) == "" {
+		return Article{}, ErrValidation
+	}
+
+	categoryID, err := s.categoryIDBySlug(input.CategorySlug)
+	if err != nil {
+		return Article{}, ErrValidation
+	}
+
+	status := normalizeArticleStatus(input.Status)
+	row := s.db.QueryRow(`
+INSERT INTO articles (
+	title, slug, excerpt, content_md, content_html, status, category_id,
+	meta_title, meta_description, cover_image_url
+)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+RETURNING id`,
+		input.Title,
+		input.Slug,
+		input.Excerpt,
+		input.ContentMD,
+		input.ContentHTML,
+		status,
+		categoryID,
+		coalesce(input.MetaTitle, input.Title),
+		input.MetaDescription,
+		input.CoverImageURL,
+	)
+
+	var id int64
+	if err := row.Scan(&id); err != nil {
+		return Article{}, ErrValidation
+	}
+
+	return s.getArticleByID(id)
+}
+
+func (s *Store) UpdateArticle(id string, input UpdateArticleInput) (Article, error) {
+	articleID, err := strconv.ParseInt(id, 10, 64)
+	if err != nil {
+		return Article{}, ErrValidation
+	}
+
+	current, err := s.getArticleByID(articleID)
+	if err != nil {
+		return Article{}, err
+	}
+
+	categoryID := current.CategoryID
+	categorySlug := current.CategorySlug
+	if strings.TrimSpace(input.CategorySlug) != "" {
+		resolvedID, err := s.categoryIDBySlug(input.CategorySlug)
+		if err != nil {
+			return Article{}, ErrValidation
+		}
+		categoryID = resolvedID
+		categorySlug = input.CategorySlug
+	}
+
+	updated := Article{
+		ID:              current.ID,
+		Title:           firstNonEmpty(input.Title, current.Title),
+		Slug:            firstNonEmpty(input.Slug, current.Slug),
+		Excerpt:         firstNonEmpty(input.Excerpt, current.Excerpt),
+		ContentMD:       firstNonEmpty(input.ContentMD, current.ContentMD),
+		ContentHTML:     firstNonEmpty(input.ContentHTML, current.ContentHTML),
+		Status:          normalizeArticleStatus(firstNonEmpty(input.Status, string(current.Status))),
+		CategoryID:      categoryID,
+		CategorySlug:    categorySlug,
+		MetaTitle:       firstNonEmpty(input.MetaTitle, current.MetaTitle),
+		MetaDescription: firstNonEmpty(input.MetaDescription, current.MetaDescription),
+		CoverImageURL:   firstNonEmpty(input.CoverImageURL, current.CoverImageURL),
+	}
+
+	if _, err := s.db.Exec(`
+UPDATE articles
+SET title = $1,
+    slug = $2,
+    excerpt = $3,
+    content_md = $4,
+    content_html = $5,
+    status = $6,
+    category_id = $7,
+    meta_title = $8,
+    meta_description = $9,
+    cover_image_url = $10,
+    updated_at = NOW()
+WHERE id = $11`,
+		updated.Title,
+		updated.Slug,
+		updated.Excerpt,
+		updated.ContentMD,
+		updated.ContentHTML,
+		updated.Status,
+		categoryID,
+		updated.MetaTitle,
+		updated.MetaDescription,
+		updated.CoverImageURL,
+		articleID,
+	); err != nil {
+		return Article{}, ErrValidation
+	}
+
+	return s.getArticleByID(articleID)
+}
+
+func (s *Store) PublishArticle(id string) (Article, error) {
+	articleID, err := strconv.ParseInt(id, 10, 64)
+	if err != nil {
+		return Article{}, ErrValidation
+	}
+
+	article, err := s.getArticleByID(articleID)
+	if err != nil {
+		return Article{}, err
+	}
+
+	if strings.TrimSpace(article.Title) == "" || strings.TrimSpace(article.Slug) == "" || strings.TrimSpace(article.MetaDescription) == "" || strings.TrimSpace(article.CategorySlug) == "" {
+		return Article{}, ErrPublishGateFailed
+	}
+
+	var passed bool
+	err = s.db.QueryRow(`
+SELECT EXISTS (
+	SELECT 1
+	FROM plagiarism_checks
+	WHERE article_id = $1 AND status = 'pass'
+)`, articleID).Scan(&passed)
+	if err != nil {
+		return Article{}, err
+	}
+	if !passed {
+		return Article{}, ErrPublishGateFailed
+	}
+
+	result, err := s.db.Exec(`
+UPDATE articles
+SET status = 'published',
+    published_at = NOW(),
+    updated_at = NOW()
+WHERE id = $1`, articleID)
+	if err != nil {
+		return Article{}, err
+	}
+
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		return Article{}, ErrNotFound
+	}
+
+	return s.getArticleByID(articleID)
+}
+
+func (s *Store) ScheduleArticle(id string) (Article, error) {
+	articleID, err := strconv.ParseInt(id, 10, 64)
+	if err != nil {
+		return Article{}, ErrValidation
+	}
+
+	result, err := s.db.Exec(`
+UPDATE articles
+SET status = 'scheduled',
+    updated_at = NOW()
+WHERE id = $1`, articleID)
+	if err != nil {
+		return Article{}, err
+	}
+
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		return Article{}, ErrNotFound
+	}
+
+	return s.getArticleByID(articleID)
+}
+
+func (s *Store) EnqueueJob(articleID, jobType string, payload map[string]any) (Job, error) {
+	id, err := strconv.ParseInt(articleID, 10, 64)
+	if err != nil {
+		return Job{}, ErrValidation
+	}
+
+	if _, err := s.getArticleByID(id); err != nil {
+		return Job{}, err
+	}
+
+	payloadJSON, _ := json.Marshal(payload)
+	resultJSON, _ := json.Marshal(map[string]any{"message": "queued for worker processing"})
+
+	row := s.db.QueryRow(`
+INSERT INTO content_jobs (article_id, job_type, status, payload, result_summary)
+VALUES ($1, $2, 'queued', $3::jsonb, $4::jsonb)
+RETURNING id, created_at, updated_at`, id, jobType, string(payloadJSON), string(resultJSON))
+
+	var jobID int64
+	var createdAt time.Time
+	var updatedAt time.Time
+	if err := row.Scan(&jobID, &createdAt, &updatedAt); err != nil {
+		return Job{}, err
+	}
+
+	return Job{
+		ID:            strconv.FormatInt(jobID, 10),
+		ArticleID:     articleID,
+		JobType:       jobType,
+		Status:        "queued",
+		Payload:       payload,
+		ResultSummary: map[string]any{"message": "queued for worker processing"},
+		CreatedAt:     createdAt,
+		UpdatedAt:     updatedAt,
+	}, nil
+}
+
+func (s *Store) ListJobs() []Job {
+	rows, err := s.db.Query(`
+SELECT id, COALESCE(article_id, 0), job_type, status, payload, result_summary, error_message, created_at, updated_at
+FROM content_jobs
+ORDER BY created_at DESC
+LIMIT 50`)
+	if err != nil {
+		return []Job{}
+	}
+	defer rows.Close()
+
+	var jobs []Job
+	for rows.Next() {
+		var (
+			job            Job
+			id             int64
+			articleID      int64
+			payloadRaw     []byte
+			resultSummary  []byte
+		)
+		if err := rows.Scan(&id, &articleID, &job.JobType, &job.Status, &payloadRaw, &resultSummary, &job.ErrorMessage, &job.CreatedAt, &job.UpdatedAt); err != nil {
+			continue
+		}
+		job.ID = strconv.FormatInt(id, 10)
+		if articleID > 0 {
+			job.ArticleID = strconv.FormatInt(articleID, 10)
+		}
+		job.Payload = parseJSONMap(payloadRaw)
+		job.ResultSummary = parseJSONMap(resultSummary)
+		jobs = append(jobs, job)
+	}
+
+	return jobs
+}
+
+func (s *Store) ListCategories() []Category {
+	rows, err := s.db.Query(`
+SELECT id, name, slug, description, created_at, updated_at
+FROM categories
+ORDER BY name ASC`)
+	if err != nil {
+		return []Category{}
+	}
+	defer rows.Close()
+
+	var categories []Category
+	for rows.Next() {
+		var (
+			category Category
+			id       int64
+		)
+		if err := rows.Scan(&id, &category.Name, &category.Slug, &category.Description, &category.CreatedAt, &category.UpdatedAt); err != nil {
+			continue
+		}
+		category.ID = strconv.FormatInt(id, 10)
+		categories = append(categories, category)
+	}
+
+	return categories
+}
+
+func (s *Store) ListPublishedArticlesByCategory(slug string) ([]Article, error) {
+	rows, err := s.db.Query(articleSelectQuery+`
+WHERE a.status = 'published' AND c.slug = $1
+ORDER BY a.published_at DESC NULLS LAST, a.updated_at DESC`, slug)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	articles := scanArticles(rows)
+	if len(articles) > 0 {
+		return articles, nil
+	}
+
+	var exists bool
+	if err := s.db.QueryRow(`SELECT EXISTS (SELECT 1 FROM categories WHERE slug = $1)`, slug).Scan(&exists); err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, ErrNotFound
+	}
+
+	return []Article{}, nil
+}
+
+func (s *Store) ListSources() []Source {
+	rows, err := s.db.Query(`
+SELECT id, domain, source_name, category, review_status, robots_status, terms_review_status, crawl_enabled, crawl_interval_minutes, last_checked_at, created_at, updated_at
+FROM sources
+ORDER BY domain ASC`)
+	if err != nil {
+		return []Source{}
+	}
+	defer rows.Close()
+
+	var sources []Source
+	for rows.Next() {
+		source, err := scanSource(rows)
+		if err != nil {
+			continue
+		}
+		sources = append(sources, source)
+	}
+
+	return sources
+}
+
+func (s *Store) CreateSource(input CreateSourceInput) (Source, error) {
+	if strings.TrimSpace(input.Domain) == "" || strings.TrimSpace(input.SourceName) == "" {
+		return Source{}, ErrValidation
+	}
+
+	row := s.db.QueryRow(`
+INSERT INTO sources (
+	domain, source_name, category, review_status, robots_status, terms_review_status, crawl_enabled, crawl_interval_minutes
+)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+RETURNING id, domain, source_name, category, review_status, robots_status, terms_review_status, crawl_enabled, crawl_interval_minutes, last_checked_at, created_at, updated_at`,
+		strings.ToLower(strings.TrimSpace(input.Domain)),
+		input.SourceName,
+		input.Category,
+		coalesce(input.ReviewStatus, "restricted"),
+		coalesce(input.RobotsStatus, "unknown"),
+		coalesce(input.TermsReviewStatus, "pending"),
+		input.CrawlEnabled,
+		defaultInt(input.CrawlIntervalMinutes, 360),
+	)
+
+	source, err := scanSource(row)
+	if err != nil {
+		return Source{}, ErrValidation
+	}
+
+	return source, nil
+}
+
+func (s *Store) UpdateSource(id string, input UpdateSourceInput) (Source, error) {
+	sourceID, err := strconv.ParseInt(id, 10, 64)
+	if err != nil {
+		return Source{}, ErrValidation
+	}
+
+	current, err := s.getSourceByID(sourceID)
+	if err != nil {
+		return Source{}, err
+	}
+
+	row := s.db.QueryRow(`
+UPDATE sources
+SET source_name = $1,
+    category = $2,
+    review_status = $3,
+    robots_status = $4,
+    terms_review_status = $5,
+    crawl_enabled = $6,
+    crawl_interval_minutes = $7,
+    updated_at = NOW()
+WHERE id = $8
+RETURNING id, domain, source_name, category, review_status, robots_status, terms_review_status, crawl_enabled, crawl_interval_minutes, last_checked_at, created_at, updated_at`,
+		firstNonEmpty(input.SourceName, current.SourceName),
+		firstNonEmpty(input.Category, current.Category),
+		firstNonEmpty(input.ReviewStatus, current.ReviewStatus),
+		firstNonEmpty(input.RobotsStatus, current.RobotsStatus),
+		firstNonEmpty(input.TermsReviewStatus, current.TermsReviewStatus),
+		input.CrawlEnabled,
+		defaultInt(input.CrawlIntervalMinutes, current.CrawlIntervalMinutes),
+		sourceID,
+	)
+
+	source, err := scanSource(row)
+	if err != nil {
+		return Source{}, err
+	}
+
+	return source, nil
+}
+
+func (s *Store) ListTrendCandidates() []TrendCandidate {
+	rows, err := s.db.Query(`
+SELECT
+	sr.title,
+	COALESCE(MAX(sr.trend_score)::int, 0) AS trend_score,
+	COUNT(DISTINCT sr.source_id) AS approved_sources,
+	COALESCE(string_agg(sr.url, ',' ORDER BY sr.trend_score DESC), '') AS urls
+FROM source_records sr
+JOIN sources s ON s.id = sr.source_id
+WHERE s.review_status = 'approved'
+GROUP BY sr.title
+ORDER BY MAX(sr.trend_score) DESC, sr.title ASC
+LIMIT 20`)
+	if err != nil {
+		return []TrendCandidate{}
+	}
+	defer rows.Close()
+
+	var trends []TrendCandidate
+	for rows.Next() {
+		var (
+			trend TrendCandidate
+			urls  string
+		)
+		if err := rows.Scan(&trend.Topic, &trend.TrendScore, &trend.ApprovedSources, &urls); err != nil {
+			continue
+		}
+		if urls != "" {
+			trend.SourceRecordURLs = strings.Split(urls, ",")
+		} else {
+			trend.SourceRecordURLs = []string{}
+		}
+		trends = append(trends, trend)
+	}
+
+	return trends
+}
+
+func (s *Store) categoryIDBySlug(slug string) (int64, error) {
+	var id int64
+	err := s.db.QueryRow(`SELECT id FROM categories WHERE slug = $1`, slug).Scan(&id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, ErrNotFound
+		}
+		return 0, err
+	}
+
+	return id, nil
+}
+
+func (s *Store) getArticleByID(id int64) (Article, error) {
+	row := s.db.QueryRow(articleSelectQuery+` WHERE a.id = $1`, id)
+	article, err := scanArticle(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Article{}, ErrNotFound
+		}
+		return Article{}, err
+	}
+	return article, nil
+}
+
+func (s *Store) getSourceByID(id int64) (Source, error) {
+	row := s.db.QueryRow(`
+SELECT id, domain, source_name, category, review_status, robots_status, terms_review_status, crawl_enabled, crawl_interval_minutes, last_checked_at, created_at, updated_at
+FROM sources
+WHERE id = $1`, id)
+
+	source, err := scanSource(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Source{}, ErrNotFound
+		}
+		return Source{}, err
+	}
+	return source, nil
+}
+
+type articleScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanArticle(scanner articleScanner) (Article, error) {
+	var (
+		article     Article
+		id          int64
+		categoryID  sql.NullInt64
+		authorID    sql.NullInt64
+		categorySlug sql.NullString
+		publishedAt sql.NullTime
+	)
+
+	err := scanner.Scan(
+		&id,
+		&article.Title,
+		&article.Slug,
+		&article.Excerpt,
+		&article.ContentMD,
+		&article.ContentHTML,
+		&article.Status,
+		&categoryID,
+		&categorySlug,
+		&authorID,
+		&article.MetaTitle,
+		&article.MetaDescription,
+		&article.CoverImageURL,
+		&publishedAt,
+		&article.CreatedAt,
+		&article.UpdatedAt,
+	)
+	if err != nil {
+		return Article{}, err
+	}
+
+	article.ID = strconv.FormatInt(id, 10)
+	if categoryID.Valid {
+		article.CategoryID = strconv.FormatInt(categoryID.Int64, 10)
+	}
+	if categorySlug.Valid {
+		article.CategorySlug = categorySlug.String
+	}
+	if authorID.Valid {
+		article.AuthorID = strconv.FormatInt(authorID.Int64, 10)
+	}
+	if publishedAt.Valid {
+		article.PublishedAt = &publishedAt.Time
+	}
+
+	return article, nil
+}
+
+func scanArticles(rows *sql.Rows) []Article {
+	var articles []Article
+	for rows.Next() {
+		article, err := scanArticle(rows)
+		if err != nil {
+			continue
+		}
+		articles = append(articles, article)
+	}
+
+	return articles
+}
+
+type sourceScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanSource(scanner sourceScanner) (Source, error) {
+	var (
+		source        Source
+		id            int64
+		lastCheckedAt sql.NullTime
+	)
+	err := scanner.Scan(
+		&id,
+		&source.Domain,
+		&source.SourceName,
+		&source.Category,
+		&source.ReviewStatus,
+		&source.RobotsStatus,
+		&source.TermsReviewStatus,
+		&source.CrawlEnabled,
+		&source.CrawlIntervalMinutes,
+		&lastCheckedAt,
+		&source.CreatedAt,
+		&source.UpdatedAt,
+	)
+	if err != nil {
+		return Source{}, err
+	}
+
+	source.ID = strconv.FormatInt(id, 10)
+	if lastCheckedAt.Valid {
+		source.LastCheckedAt = &lastCheckedAt.Time
+	}
+
+	return source, nil
+}
+
+func parseJSONMap(raw []byte) map[string]any {
+	if len(raw) == 0 {
+		return map[string]any{}
+	}
+
+	var value map[string]any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return map[string]any{}
+	}
+
+	return value
+}
+
+func normalizeArticleStatus(raw string) ArticleStatus {
+	switch ArticleStatus(raw) {
+	case StatusIdea, StatusSourced, StatusDraft, StatusAIAssisted, StatusPlagiarismCheck, StatusReview, StatusScheduled, StatusPublished, StatusArchived:
+		return ArticleStatus(raw)
+	default:
+		return StatusDraft
+	}
+}
+
+func coalesce(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
+}
+
+func firstNonEmpty(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
+}
+
+func defaultInt(value, fallback int) int {
+	if value <= 0 {
+		return fallback
+	}
+	return value
+}
+
+const articleSelectQuery = `
+SELECT
+	a.id,
+	a.title,
+	a.slug,
+	a.excerpt,
+	a.content_md,
+	a.content_html,
+	a.status,
+	a.category_id,
+	c.slug AS category_slug,
+	a.author_id,
+	a.meta_title,
+	a.meta_description,
+	a.cover_image_url,
+	a.published_at,
+	a.created_at,
+	a.updated_at
+FROM articles a
+LEFT JOIN categories c ON c.id = a.category_id`
